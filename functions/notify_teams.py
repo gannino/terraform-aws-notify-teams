@@ -1,7 +1,8 @@
 import json
 import logging
 import os
-import requests
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from typing import Any, Dict
 
 HOOK_URL = os.environ['TEAMS_WEBHOOK_URL']
@@ -53,7 +54,8 @@ def build_adaptive_card(data: Dict[str, str]) -> Dict[str, Any]:
                         {
                             "type": "TextBlock",
                             "text": data["title"],
-                            "                            "size": "Medium",
+                            "weight": "Bolder",
+                            "size": "Medium",
                             "color": data.get("colour", "Default")
                         },
                         {
@@ -127,8 +129,15 @@ def lambda_handler(event, context):
     card_payload = build_adaptive_card(data)
 
     try:
-        response = requests.post(HOOK_URL, json=card_payload)
-        response.raise_for_status()
+        req = Request(
+            HOOK_URL,
+            data=json.dumps(card_payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        with urlopen(req) as response:
+            response.read()
         logger.info("Message posted successfully.")
-    except requests.exceptions.RequestException as e:
-        logger.error("Failed to post message: %s", e)
+    except HTTPError as e:
+        logger.error("Request failed: %d %s", e.code, e.reason)
+    except URLError as e:
+        logger.error("Server connection failed: %s", e.reason)
