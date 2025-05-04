@@ -1,128 +1,134 @@
-# https://medium.com/@sebastian.phelps/aws-cloudwatch-alarms-on-microsoft-teams-9b5239e23b64
 import json
 import logging
 import os
-from urllib.error import URLError, HTTPError
-from urllib.request import Request, urlopen
+import requests
+from typing import Any, Dict
 
 HOOK_URL = os.environ['TEAMS_WEBHOOK_URL']
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-def parse_cloudtrail_event(message_json_detail):
-  logger.info("message_json_detail: %s", json.dumps(message_json_detail))
 
-  alarm_name = message_json_detail['eventName']
-  
-  reason = message_json_detail['errorMessage']
+def is_cloudwatch_alarm(message: str) -> bool:
+    try:
+        message_json = json.loads(message)
+        return 'AlarmName' in message_json
+    except json.JSONDecodeError:
+        return False
 
-  data = {
-    "colour": "d63333",
-    "title": "Alert - %s - There is an issue: %s" % (reason.split(":")[6].split(" ")[0], alarm_name),
-    "text": json.dumps({
-      "Subject": alarm_name,
-      "Type": message_json_detail['eventType'],
-      "MessageId": message_json_detail['eventID'],
-      "Message": reason,
-      "Timestamp": message_json_detail['eventTime']
-    })
-  }
-  # return data from the function
-  return data
 
+def parse_cloudtrail_event(detail: Dict[str, Any]) -> Dict[str, str]:
+    logger.info("CloudTrail detail: %s", json.dumps(detail))
+
+    alarm_name = detail.get('eventName', 'UnknownEvent')
+    reason = detail.get('errorMessage', 'No error message provided')
+
+    title = f"Alert - {reason.split(':')[6].split(' ')[0]} - Issue: {alarm_name}" if ':' in reason else f"Alert - Issue: {alarm_name}"
+
+    return {
+        "colour": "Attention",
+        "title": title,
+        "text": json.dumps({
+            "Subject": alarm_name,
+            "Type": detail.get('eventType', 'Unknown'),
+            "MessageId": detail.get('eventID', 'Unknown'),
+            "Message": reason,
+            "Timestamp": detail.get('eventTime', 'Unknown')
+        }, indent=2)
+    }
+
+
+def build_adaptive_card(data: Dict[str, str]) -> Dict[str, Any]:
+    return {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.5",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": data["title"],
+                            "                            "size": "Medium",
+                            "color": data.get("colour", "Default")
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": data["text"],
+                            "wrap": True
+                        }
+                    ]
+                }
+            }
+        ]
+    }
 
 
 def lambda_handler(event, context):
     logger.info("Event: %s", json.dumps(event))
-    message = event['Records'][0]['Sns']['Message']
-
+    sns_record = event['Records'][0]['Sns']
+    message = sns_record['Message']
     message_json = json.loads(message)
 
-    if 'AlarmName' in message_json:
-      data = ""
-      if is_cloudwatch_alarm(message):
-        message_json = json.loads(event['Records'][0]['Sns']['Message'])
+    data = {}
+
+    if 'AlarmName' in message_json and is_cloudwatch_alarm(message):
         alarm_name = message_json['AlarmName']
         old_state = message_json['OldStateValue']
         new_state = message_json['NewStateValue']
         reason = message_json['NewStateReason']
-        logger.info("Message: %s", json.dumps(message_json))
+
+        logger.info("CloudWatch Alarm: %s", json.dumps(message_json))
 
         base_data = {
-          "colour": "64a837",
-          "title": "**%s** is resolved" % alarm_name,
-          "text": "**%s** has changed from %s to %s - %s" % (
-            alarm_name, old_state, new_state, reason)
+            "colour": "Good" if new_state.lower() != 'alarm' else "Attention",
+            "title": f"{'Resolved' if new_state.lower() != 'alarm' else 'Red Alert'} - {alarm_name}",
+            "text": f"**{alarm_name}** changed from **{old_state}** to **{new_state}**\n\nReason: {reason}"
         }
-        if new_state.lower() == 'alarm':
-            base_data = {
-              "colour": "d63333",
-              "title": "Red Alert - There is an issue %s" % alarm_name,
-              "text": "**%s** has changed from %s to %s - %s" % (
-                alarm_name, old_state, new_state, reason)
+
+        overrides = {
+            ('ALARM', 'my-alarm-name'): {
+                "colour": "Attention",
+                "title": "Red Alert - A bad thing happened.",
+                "text": "These are the specific details of the bad thing."
+            },
+            ('OK', 'my-alarm-name'): {
+                "colour": "Good",
+                "title": "The bad thing stopped happening",
+                "text": "These are the specific details of how we know the bad thing stopped happening"
             }
-
-        messages = {
-          ('ALARM', 'my-alarm-name'): {
-            "colour": "d63333",
-            "title": "Red Alert - A bad thing happened.",
-            "text": "These are the specific details of the bad thing."
-          },
-          ('OK', 'my-alarm-name'): {
-            "colour": "64a837",
-            "title": "The bad thing stopped happening",
-            "text": "These are the specific details of how we know the bad "
-                    "thing stopped happening "
-          }
         }
-        data = messages.get((new_state, alarm_name), base_data)
 
-      else:
-        data = {
-          "colour": "d63333",
-          "title": "Alert - There is an issue: %s" % event['Records'][0]['Sns']['Subject'],
-          "text": json.dumps({
-            "Subject": event['Records'][0]['Sns']['Subject'],
-            "Type": event['Records'][0]['Sns']['Type'],
-            "MessageId": event['Records'][0]['Sns']['MessageId'],
-            "TopicArn": event['Records'][0]['Sns']['TopicArn'],
-            "Message": event['Records'][0]['Sns']['Message'],
-            "Timestamp": event['Records'][0]['Sns']['Timestamp']
-          })
-        }
-    elif 'detail-type' in message_json and message_json['detail-type'] == 'AWS Service Event via CloudTrail':
-      logger.info("Parsing cloudtrail message json !!")
-      data = parse_cloudtrail_event(message_json['detail'])
+        data = overrides.get((new_state, alarm_name), base_data)
+
+    elif message_json.get('detail-type') == 'AWS Service Event via CloudTrail':
+        logger.info("Parsing CloudTrail event")
+        data = parse_cloudtrail_event(message_json['detail'])
+
     else:
-      logger.info("None of the properties are present!!")
+        logger.info("Fallback SNS message")
+        data = {
+            "colour": "Warning",
+            "title": f"Alert - {sns_record.get('Subject', 'No Subject')}",
+            "text": json.dumps({
+                "Subject": sns_record.get('Subject'),
+                "Type": sns_record.get('Type'),
+                "MessageId": sns_record.get('MessageId'),
+                "TopicArn": sns_record.get('TopicArn'),
+                "Message": sns_record.get('Message'),
+                "Timestamp": sns_record.get('Timestamp')
+            }, indent=2)
+        }
 
-    message = {
-      "@context": "https://schema.org/extensions",
-      "@type": "MessageCard",
-      "themeColor": data["colour"],
-      "title": data["title"],
-      "text": data["text"]
-    }
+    card_payload = build_adaptive_card(data)
 
-    # Explicitly set Content-Type to 'application/json'
-    req = Request(HOOK_URL, json.dumps(message).encode('utf-8'), headers={'Content-Type': 'application/json'})
     try:
-        response = urlopen(req)
-        response.read()
-        logger.info("Message posted")
-    except HTTPError as e:
-        logger.error("Request failed: %d %s", e.code, e.reason)
-    except URLError as e:
-        logger.error("Server connection failed: %s", e.reason)
-
-
-def is_cloudwatch_alarm(message):
-    try:
-        message_json = json.loads(message)
-        if message_json['AlarmName']:
-            return True
-        else:
-            return False
-    except ValueError as e:
-        return False
+        response = requests.post(HOOK_URL, json=card_payload)
+        response.raise_for_status()
+        logger.info("Message posted successfully.")
+    except requests.exceptions.RequestException as e:
+        logger.error("Failed to post message: %s", e)

@@ -98,7 +98,7 @@ module "lambda" {
 
   hash_extra                     = var.hash_extra
   handler                        = "${local.lambda_handler}.lambda_handler"
-  source_path                    = var.lambda_source_path != null ? "${path.root}/${var.lambda_source_path}" : "${path.module}/functions/notify_teams_adaptive_card.py"
+  source_path                    = var.lambda_source_path != null ? "${path.root}/${var.lambda_source_path}" : "${path.module}/functions/notify_teams.py"
   recreate_missing_package       = var.recreate_missing_package
   runtime                        = "python3.11"
   architectures                  = var.architectures
