@@ -1,31 +1,22 @@
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 data "aws_region" "current" {}
 
-resource "aws_sns_topic" "this" {
-  count = var.create_sns_topic && var.create ? 1 : 0
-
-  name = var.sns_topic_name
-
-  kms_master_key_id = var.sns_topic_kms_key_id
-
-  tags = merge(var.tags, var.sns_topic_tags)
-}
-
 locals {
-  sns_topic_arn = element(
-    concat(
-      aws_sns_topic.this.*.arn,
-      ["arn:aws:sns:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:${var.sns_topic_name}"],
-      [""]
-    ),
-    0,
+  create = var.create && var.putin_khuylo
+
+  sns_topic_arn = try(
+    aws_sns_topic.this[0].arn,
+    "arn:${data.aws_partition.current.id}:sns:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:${var.sns_topic_name}",
+    ""
   )
 
+  sns_feedback_role = local.create_sns_feedback_role ? aws_iam_role.sns_feedback_role[0].arn : var.sns_topic_lambda_feedback_role_arn
   lambda_policy_document = {
     sid       = "AllowWriteToCloudwatchLogs"
     effect    = "Allow"
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = [replace("${element(concat(aws_cloudwatch_log_group.lambda[*].arn, tolist([""])), 0)}:*", ":*:*", ":*")]
+    resources = [replace("${try(aws_cloudwatch_log_group.lambda[0].arn, "")}:*", ":*:*", ":*")]
   }
 
   lambda_policy_document_kms = {
@@ -34,13 +25,24 @@ locals {
     actions   = ["kms:Decrypt"]
     resources = [var.kms_key_arn]
   }
+
+  lambda_policy_document_securityhub = {
+    sid       = "AllowSecurityHub"
+    effect    = "Allow"
+    actions   = ["securityhub:BatchUpdateFindings"]
+    resources = ["*"]
+  }
+
+  lambda_handler = try(split(".", basename(var.lambda_source_path))[0], "notify_teams")
+  
 }
 
 data "aws_iam_policy_document" "lambda" {
   count = var.create ? 1 : 0
 
   dynamic "statement" {
-    for_each = concat([local.lambda_policy_document], var.kms_key_arn != "" ? [local.lambda_policy_document_kms] : [])
+    for_each = concat([local.lambda_policy_document,
+    local.lambda_policy_document_securityhub], var.kms_key_arn != "" ? [local.lambda_policy_document_kms] : [])
     content {
       sid       = statement.value.sid
       effect    = statement.value.effect
@@ -60,54 +62,81 @@ resource "aws_cloudwatch_log_group" "lambda" {
   tags = merge(var.tags, var.cloudwatch_log_group_tags)
 }
 
+resource "aws_sns_topic" "this" {
+  count = var.create_sns_topic && var.create ? 1 : 0
+
+  name = var.sns_topic_name
+
+  kms_master_key_id = var.sns_topic_kms_key_id
+
+  lambda_failure_feedback_role_arn    = var.enable_sns_topic_delivery_status_logs ? local.sns_feedback_role : null
+  lambda_success_feedback_role_arn    = var.enable_sns_topic_delivery_status_logs ? local.sns_feedback_role : null
+  lambda_success_feedback_sample_rate = var.enable_sns_topic_delivery_status_logs ? var.sns_topic_lambda_feedback_sample_rate : null
+
+  tags = merge(var.tags, var.sns_topic_tags)
+}
+
+
 resource "aws_sns_topic_subscription" "sns_notify_teams" {
   count = var.create ? 1 : 0
 
-  topic_arn     = local.sns_topic_arn
-  protocol      = "lambda"
-  endpoint      = module.lambda.lambda_function_arn
-  filter_policy = var.subscription_filter_policy
+  topic_arn           = local.sns_topic_arn
+  protocol            = "lambda"
+  endpoint            = module.lambda.lambda_function_arn
+  filter_policy       = var.subscription_filter_policy
+  filter_policy_scope = var.subscription_filter_policy_scope
 }
 
 module "lambda" {
   source  = "terraform-aws-modules/lambda/aws"
-  version = "2.34.1"
+  version = "6.8.0"
 
   create = var.create
 
   function_name = var.lambda_function_name
   description   = var.lambda_description
 
-  handler                        = "notify_teams.lambda_handler"
-  source_path                    = "${path.module}/functions/notify_teams.py"
-  runtime                        = var.python_version
+  hash_extra                     = var.hash_extra
+  handler                        = "${local.lambda_handler}.lambda_handler"
+  source_path                    = var.lambda_source_path != null ? "${path.root}/${var.lambda_source_path}" : "${path.module}/functions/notify_teams_adaptive_card.py"
+  recreate_missing_package       = var.recreate_missing_package
+  runtime                        = "python3.11"
+  architectures                  = var.architectures
   timeout                        = 30
   kms_key_arn                    = var.kms_key_arn
   reserved_concurrent_executions = var.reserved_concurrent_executions
+  ephemeral_storage_size         = var.lambda_function_ephemeral_storage_size
+  trigger_on_package_timestamp   = var.trigger_on_package_timestamp
 
-  // If publish is disabled, there will be "Error adding new Lambda Permission for notify_teams: InvalidParameterValueException: We currently do not support adding policies for $LATEST."
+  # If publish is disabled, there will be "Error adding new Lambda Permission for notify_teams:
+  # InvalidParameterValueException: We currently do not support adding policies for $LATEST."
   publish = true
 
   environment_variables = {
     TEAMS_WEBHOOK_URL = var.teams_webhook_url
-    LOG_EVENTS        = var.log_events ? "True" : "False"
-  }
+    LOG_EVENTS        = var.log_events ? "True" : "False"  
+    }
 
   create_role               = var.lambda_role == ""
   lambda_role               = var.lambda_role
   role_name                 = "${var.iam_role_name_prefix}-${var.lambda_function_name}"
   role_permissions_boundary = var.iam_role_boundary_policy_arn
   role_tags                 = var.iam_role_tags
+  role_path                 = var.iam_role_path
+  policy_path               = var.iam_policy_path
 
   # Do not use Lambda's policy for cloudwatch logs, because we have to add a policy
   # for KMS conditionally. This way attach_policy_json is always true independenty of
   # the value of presense of KMS. Famous "computed values in count" bug...
   attach_cloudwatch_logs_policy = false
   attach_policy_json            = true
-  policy_json                   = element(concat(data.aws_iam_policy_document.lambda[*].json, [""]), 0)
+  policy_json                   = try(data.aws_iam_policy_document.lambda[0].json, "")
 
   use_existing_cloudwatch_log_group = true
   attach_network_policy             = var.lambda_function_vpc_subnet_ids != null
+
+  dead_letter_target_arn    = var.lambda_dead_letter_target_arn
+  attach_dead_letter_policy = var.lambda_attach_dead_letter_policy
 
   allowed_triggers = {
     AllowExecutionFromSNS = {

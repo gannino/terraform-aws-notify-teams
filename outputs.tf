@@ -1,3 +1,9 @@
+output "teams_topic_arn" {
+  description = "The ARN of the SNS topic from which messages will be sent to Teams"
+  value       = local.sns_topic_arn
+}
+
+# todo: Remove `this_slack_topic_arn` output during next major release 5.x
 output "this_teams_topic_arn" {
   description = "The ARN of the SNS topic from which messages will be sent to Teams"
   value       = local.sns_topic_arn
@@ -41,4 +47,9 @@ output "notify_teams_lambda_function_version" {
 output "lambda_cloudwatch_log_group_arn" {
   description = "The Amazon Resource Name (ARN) specifying the log group"
   value       = element(concat(aws_cloudwatch_log_group.lambda.*.arn, [""]), 0)
+}
+
+output "sns_topic_feedback_role_arn" {
+  description = "The Amazon Resource Name (ARN) of the IAM role used for SNS delivery status logging"
+  value       = local.sns_feedback_role
 }
